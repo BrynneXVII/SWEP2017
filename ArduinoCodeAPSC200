@@ -1,0 +1,880 @@
+#include <SoftwareSerial.h>
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+#include "Wire.h"
+#include "math.h"
+
+MPU6050 accelgyro(0x68);
+SoftwareSerial XBee(4,5);
+
+#define MOTOR_R 0 // right motor (A)
+#define MOTOR_L 1 // left motor (B)
+#define DIRA 8 // Direction control for motor A
+#define PWMA 9  // PWM control (speed) for motor A
+#define DIRB 7 // Direction control for motor B
+#define PWMB 10 // PWM control (speed) for motor B
+///////////////////////////////////REMOTE CONTROL OR REGULAR LLOYD'S ALGORITHM SIMULATION /////////////////////
+bool lloyds_regular = true;
+/////////////////////////////// GYROSCOPE FUNCTION CALIBRATION VARIABLES ///////////////////////////////
+int gz_offset, mean_gz, ready;
+int buffersize=1000;     //Amount of readings used to average, make it higher to get more precision but sketch will be slower  (default:1000)
+int acel_deadzone=8;     //Acelerometer error allowed, make it lower to get more precision, but sketch may not converge  (default:8)
+int giro_deadzone=1;     //Giro error allowed, make it lower to get more precision, but sketch may not converge  (default:1)
+float gz;
+/////////////////////////////// MOTOR FUNCTION VARIABLES ///////////////////////////////////////////////
+byte dir;
+/////////////////////////////// ENCODER FUNCTION VARIABLES ///////////////////////////////////////////////
+int lCount, rCount, lCount_abs, rCount_abs, lCount_abs_first, rCount_abs_first, left_speed, right_speed=0;
+int Encoder_Pin_Left = 3;
+int Encoder_Pin_Right = 2;
+/////////////////////////////// XBEE RECEIVING FUNCTION VARIABLES /////////////////////////////////////////////
+char agent_tag, received_tag; 
+char correct_data_char = 'T';
+char false_data_char = 'F';
+char x_char = 'X';
+char y_char = 'Y';
+char compare = '0';
+char received[50];
+int number_of_bytes_per_value = 4; // 2 decimals + point + (integer < 10)
+bool readable_data;
+bool first_point_send = true;
+/////////////////////////////// XBEE SENDING FUNCTION VARIABLES ///////////////////////////////////////////////
+String num_string, num_string_number, data_string, x_string, y_string;
+char data_send_num[50];
+////////////////////////////////////////// REMOTE CONTROL ////////////////////////////////////////////////
+char received_direction;
+char response_to_rpi_remote = 'K';
+char direction_remote[] = "wasd";
+char follower_tag[] = "EL";
+int number_of_followers = 2;
+float x_leader, y_leader;
+float distance_remote_fixed = 0.25; // In metres
+float angle_remote_fixed = 30; // In degrees
+bool turn_remote;
+bool moving_backwards, correct_signal_sent = false;
+////////////////////////////// X AND Y FUNCTION VARIABLES //////////////////////////////////////////
+int lCount_current, rCount_current, lCount_prev, rCount_prev=0;
+float x, y, ldistance, rdistance, distance=0;
+double distancePerTick=0.065*PI/192;
+////////////////////////////// THETA FUNCTION VARIABLES //////////////////////////////////////////////
+unsigned int theta_prev_time, theta_current_time;
+float theta = 0;
+double theta_delta;
+bool theta_first;
+////////////////////////////// CHANGE ANGLE VARIABLES ////////////////////////////////////////
+int rotate_clockwise;
+int theta_margin = 5;
+int theta_constant = 95;
+float theta_target, diff_theta;
+///////////////////////////// MOVE TO POINT VARIABLES ////////////////////////////////////////
+float phi;
+float base_margin_close = 0.02;
+float base_margin_far = 0.1;
+bool should_break;
+
+////////////////////////////// PID VARIABLES /////////////////////////////////////////////////
+unsigned int PID_prev, PID_current;
+int increasing_baseline;
+int base_Kp = 500;
+int base_Ki = 0;
+int base_Kd = 0;
+int other_Kp = 300;
+int other_Ki = 0;
+int other_Kd = 175;
+int baseline_cap = 120;
+int baseline_bottom = 100;
+float base_output, base_error, base_error_sum, base_error_prev, base_error_rate; 
+float other_output, other_error, other_error_sum, other_error_prev, other_error_rate;
+float base_target, other_target, x_start, y_start, x_final, y_final;
+double PID_delta;
+bool PID_first, baseline;
+
+///////////////////////////// RANDOM VARIABLES //////////////////////////////////////////////
+int start_time, current_time, cant_move_counter;
+float equation_margin = 0.001;
+bool base_in_range, shannon;
+
+void setup() {
+  setupArdumoto();
+  Serial.begin(9600);
+  Wire.begin();
+  pinMode(Encoder_Pin_Left, INPUT_PULLUP);
+  pinMode(Encoder_Pin_Right, INPUT_PULLUP);
+  digitalWrite(Encoder_Pin_Right, HIGH);
+  digitalWrite(Encoder_Pin_Left, HIGH);
+  attachInterrupt(digitalPinToInterrupt(Encoder_Pin_Left), Left_Encoder_Ticks, RISING);
+  attachInterrupt(digitalPinToInterrupt(Encoder_Pin_Right), Right_Encoder_Ticks, RISING);
+  XBee.begin(9600);
+  accelgyro.initialize();
+  while (Serial.available() && Serial.read()); // empty buffer
+  accelgyro.setZGyroOffset(0);
+  Calibration_main();
+  
+  /////////////////////////////////////// Name of Agent goes here! /////////////////////////
+  agent_tag = 'S'; // put first letter of robot name here
+  //////////////////////////////////////////////////////////////////////////////////////////
+  
+  shannon = agent_tag == 'S'; // Euler and Laplace's motors behave opposite from Shannon, so this is used to change the directions
+  if (lloyds_regular || shannon) Ready_to_Start(); // Receives whether matrix from RPi is ready
+  Determing_Start_xy(); // Depending on the agent, the starting x and y are determined
+  
+  if (lloyds_regular) Lloyds();
+  else if(shannon) Remote_Control_Leader();
+  else Remote_Control_Follower();
+}
+
+void loop() {}
+
+///////////////////////////////////   LLOYDS ALGORITHM MAIN FUNCTIONS   ////////////////////////////////////
+void Lloyds(){
+  receive_positions(); // Will give the intial point from Matlab
+  move_to_point(); // Agents will move to their initial positions
+  while (true) move_to_point();
+}
+void move_to_point(){
+  move_to_point_setup();
+  while (!should_break){ // check_break() sets should_break to true when this loop should break
+    check_increase_speeds(false); // call move to point version of check_increase_speeds()
+    theta_calc(); // update theta
+    position_calc(); // update x and y
+    get_equation(); // get equation of line that bot must follow
+    PID_calc(); // find the PID outputs that dictate motor speeds
+    calculate_speeds(); // ensure that the PID outputs are within the acceptable range
+    driveArdumoto(MOTOR_L,left_speed); // set the left motor speed
+    driveArdumoto(MOTOR_R,right_speed); // set the right motor speed
+    check_break(); // check if bot is within range of target point
+    cant_move_counter++;
+    //if (!should_break) Increase_Speeds(false); // if necessary, increase motor speeds in order to overcome static friction
+  }
+  stop_motors(); // stop moving
+  delay_master(500); // wait half a second
+  if (lloyds_regular) receive_positions(); // receive next coordinates via XBee
+}
+void move_to_point_setup(){
+  if(lloyds_regular || !shannon){
+    x_start = x; // record the x position when the robot started rotating to point towards its target point
+    y_start = y; // record the y position when the robot started rotating to point towards its target point
+    theta_target = atan2(y_final-y_start,x_final-x_start); // angle describing direction towards target point
+    theta_target = theta_target*180/PI; // convert to units of degrees
+    change_theta(); // rotate to that angle
+  }
+  x_start = x; // record the x position when the robot started moving towards its target point
+  y_start = y; // record the y position when the robot started moving towards its target point
+  phi = (atan2(y_final - y_start, x_final - x_start))*180/PI ; // Gets value in (-180,180]
+  baseline = ((phi >= -45 && phi <= 45) || phi >= 135 || phi <= -135 ); // baseline is true if x is the baseline, false if y is
+  
+  // the next 20 lines set PID-related variables to their appropriate starting values
+  base_error_sum = 0;
+  other_error_sum = 0;
+  base_error_rate = 0; 
+  other_error_rate = 0; 
+   if(baseline){
+    base_error = x_final - x_start;
+    base_error_prev = base_error;
+    other_error = y_final - y_start;
+    other_error_prev = other_error;
+    base_target = x_final;
+    increasing_baseline = (x_start <= x_final) ? 1 : -1;
+   }
+   else{
+    base_error = y_final - y_start;
+    base_error_prev = base_error;
+    other_error = x_final - x_start;
+    other_error_prev = other_error;
+    base_target = y_final;
+    increasing_baseline = (y_start <= y_final) ? 1 : -1;
+   }
+   PID_first = true; // used in PID_calc()
+   theta_first = true; // used in theta_calc()
+   should_break = false; // used in move_to_point()
+   cant_move_counter = 1;
+   lCount_abs_first = lCount_abs;
+   rCount_abs_first = rCount_abs;
+}
+void change_theta(){
+  change_theta_setup();
+  while (diff_theta > theta_margin){ // while bot is more than theta_margin away from target angle
+    check_increase_speeds(true); // call change theta version of check_increase_speeds()
+    theta_calc(); // update theta
+    position_calc(); // update x and y
+    left_speed = rotate_clockwise*theta_constant; // find left motor speed
+    right_speed = -1*rotate_clockwise*theta_constant; // find right motor speed
+    driveArdumoto(MOTOR_R,right_speed); // set right motor speed
+    driveArdumoto(MOTOR_L,left_speed); // set left motor speed
+    get_difference_theta(); // check 
+    cant_move_counter++;
+  }
+  stop_motors(); // stop moving
+  delay_master(500); // wait half a second
+}
+void change_theta_setup(){
+  if (theta >= 0) rotate_clockwise = (theta_target >= theta - 180 && theta_target <= theta) ? 1 : -1; // check which way bot should rotate
+  else if (theta < 0) rotate_clockwise = (theta_target >= theta && theta_target <= 180 + theta) ? -1 : 1; // check which way bot should rotate
+  else rotate_clockwise = (theta_target > 0) ? -1 : 1; // check which way bot should rotate
+  get_difference_theta(); // check how far bot has to rotate
+  theta_first = true; // used in theta_calc()
+  cant_move_counter = 1;
+  lCount_abs_first = lCount_abs;
+  rCount_abs_first = rCount_abs;
+  theta_constant = 95;
+}
+void position_calc(){
+  /* Variables to update always:
+   * theta 
+   */
+  lCount_current = lCount; // read the left motor encoder
+  rCount_current = rCount; // read the right motor encoder
+  ldistance = (float)(lCount_current-lCount_prev)*distancePerTick; // get left distance moved since last measurement
+  rdistance = (float)(rCount_current-rCount_prev)*distancePerTick; // get right distance moved since last measurement
+  distance = (ldistance + rdistance)/2; // calculate distance moved since last measurement
+  x = x + distance*cos(theta*PI/180); // update x coordinate
+  y = y + distance*sin(theta*PI/180); // update y coordinate
+  lCount_prev = lCount_current; // save latest left tick value
+  rCount_prev = rCount_current; // save latest right tick value
+  // Uncomment the following if you want to send positions to the rPi. The corresponding rPi code must be used
+//  x_string = XBee_Build_String(x,true);
+//  y_string = XBee_Build_String(y,false);
+//  XBee_Write(x_string,y_string);
+Serial.print("x: "); Serial.print(x); Serial.print("\t"); Serial.print("y: "); Serial.println(y);
+}
+void theta_calc(){
+  /* Variables to update before entering a loop:
+   * theta_first = true
+   */
+  if (theta_first) theta_prev_time = micros(); // if theta_calc hasn't been called in a while then we want to get new time reading
+  theta_first = false; 
+  gz = (float)accelgyro.getRotationZ()/131; // read raw gyro measurement from gyroscope
+  theta_current_time = micros();
+  theta_delta = (double)(theta_current_time - theta_prev_time)/1000000; // time passed since last call, in units of seconds
+  theta = gz*theta_delta + theta; // calculate current theta using recursive equation
+  theta = (theta > 180) ? theta-360 : theta; // keep theta less than or equal to 180
+  theta = (theta <= -180) ? theta+360 : theta; // keep theta greater than -180
+  theta_prev_time = theta_current_time; // record time for use next time this function is called
+  Serial.print("theta: "); Serial.println(theta);
+}
+void PID_calc(){
+  /* Variables to update before entering a loop:
+   *  PID_first = true if first time being called in a loop
+   *  baseline = true or false
+   *  base_error_sum = 0
+   *  base_error_prev = base_error
+   *  increasing_baseline = 1 or -1
+   *  other_error_sum = 0
+   *  other_error_prev = other_error
+   *  x_start, x_final, y_start, y_final
+   *  
+   *  Variables to update always:
+   *  x and y
+  */
+  if (PID_first) PID_prev = micros(); // if this function hasn't been called in a while take a new time reading
+  PID_current = micros(); // take current time reading
+  PID_delta = (double)(PID_current-PID_prev)/1000000; // find time passed since last time function has been called in seconds
+  PID_prev = PID_current; // record time
+  base_error = (baseline) ? base_target - x : base_target - y;
+  base_error_sum = base_error_sum + base_error*PID_delta;
+  if(!PID_first && PID_delta >= 0.000001) base_error_rate = (base_error - base_error_prev)/PID_delta; // make sure we don't divide by 0
+  base_error_prev = base_error;
+  base_output = base_Kp*base_error + base_Ki*base_error_sum + base_Kd*base_error_rate; // the baseline PID equation
+  base_output = increasing_baseline * base_output;
+  if(moving_backwards) base_output = (base_output >= 0) ? -1*base_output : base_output;
+  if(base_output >= 0){
+    base_output = (base_output > baseline_cap) ? baseline_cap : base_output; // cap the output to ensure robots don't travel too quickly
+    base_output = (base_output < baseline_bottom) ? baseline_bottom : base_output; // minimum output to ensure robots move
+  }
+  else{
+    base_output = (base_output < -1*baseline_cap) ? -1*baseline_cap : base_output; // cap the output to ensure robots don't travel too quickly
+    base_output = (base_output > -1*baseline_bottom) ? -1*baseline_bottom : base_output; // minimum output to ensure robots move
+  }
+  other_error = (baseline) ? other_target - y : other_target - x;
+  other_error_sum = other_error_sum + other_error*PID_delta;
+  if(!PID_first && PID_delta >= 0.000001) other_error_rate = (other_error - other_error_prev)/PID_delta; // make sure we don't divide by 0
+  other_error_prev = other_error;
+  other_output = other_Kp*other_error + other_Ki*other_error_sum + other_Kd*other_error_rate; // the other PID equation
+  other_output = increasing_baseline * other_output;
+
+  PID_first = false;
+}
+void get_equation(){
+  // find the value that the other variable SHOULD be at using the equation for the line that the bot should follow
+  // this value is used in PID_calc() to find the error in the other variable
+  if (baseline){
+    base_in_range = absolute_value(x_final - x_start) < equation_margin; // checks if we will divide by 0
+    other_target = (!base_in_range) ?  ((y_final - y_start)/(x_final - x_start))*x + y_final - ((y_final - y_start)/(x_final - x_start))*x_final : y_final;
+  }
+  else{
+    base_in_range = absolute_value(y_final - y_start) < equation_margin; // checks if we will divide by 0
+    other_target = (!base_in_range) ? ((x_final - x_start)/(y_final - y_start))*y + x_final - ((x_final - x_start)/(y_final - y_start))*y_final : x_final;
+  }
+}
+void get_difference_theta(){ 
+  // checks how close bot is to the target angle
+  // involves tricky logic to reflect that, for example, -175 is only 15 degrees away from 170
+  diff_theta = theta_target - theta;
+  diff_theta = (diff_theta <= -180) ? diff_theta + 360 : diff_theta;
+  diff_theta = (diff_theta > 180) ? diff_theta - 360 : diff_theta;
+  diff_theta = (theta_target >= theta) ? theta_target - theta : -1*(theta_target - theta); 
+}
+void check_break(){
+    // sets should_break to true if baseline variable is within range of its target value.
+    // the range is given by base_margin_far and base_margin_close.
+    if(baseline){
+      if(increasing_baseline == 1 && x > x_final - base_margin_close && x < x_final + base_margin_far) should_break = true;
+      else if(increasing_baseline == -1 && x > x_final - base_margin_far && x < x_final + base_margin_close) should_break = true;
+    }
+    else{
+      if(increasing_baseline == 1 && y > y_final - base_margin_close && y < y_final + base_margin_far) should_break = true;
+      else if(increasing_baseline == -1 && y > y_final - base_margin_far && y < y_final + base_margin_close) should_break = true;
+    }
+}
+void calculate_speeds(){
+  // the next 8 lines speed up either the left or right wheel in order to keep the bot on track to its target point
+  if(baseline){
+    left_speed = (other_output >= 0) ? base_output : base_output - other_output;
+    right_speed = (other_output >= 0) ? base_output + other_output : base_output;
+    }
+  else{
+    left_speed = (other_output >= 0) ? base_output + other_output : base_output;
+    right_speed = (other_output >= 0) ? base_output : base_output - other_output;
+    }
+  // the next 4 lines ensure that the wheel speeds to not exceed their maximum of 255
+    left_speed = (left_speed > 255) ? 255 : left_speed;
+    left_speed = (left_speed < -255) ? -255 : left_speed;
+    right_speed = (right_speed > 255) ? 255 : right_speed;
+    right_speed = (right_speed < -255) ? -255 : right_speed;
+}
+
+//////////////////////////////////////////// REMOTE CONTROL AND DYNAMICS ////////////////////////////////////////
+void Remote_Control_Leader(){
+  while (true){
+    move_remote_leader();
+  }
+}
+void Remote_Control_Follower(){
+  while (true){
+    receive_coordinates_remote_follower();
+    move_remote_follower();
+  }
+}
+void move_remote_leader(){
+  received_direction = '0';
+  determine_coordinates_remote();
+  turn_remote = (received_direction == direction_remote[1] || received_direction == direction_remote[3]);
+  moving_backwards = (received_direction == direction_remote[2]);
+  if (turn_remote) change_theta();
+  else{
+    XBee_Write_Remote(x_final, y_final);
+    move_to_point();
+  }
+}
+void move_remote_follower(){
+  // call function to get x and y received put into the floats x_leader and y_leader
+  // change the divisor below in order to change the dynamics of the system
+  x_final = (x_leader + x)/2;
+  y_final = (y_leader + y)/2;
+  if(agent_tag == 'E') y_final = y_final - 0.3;
+  if(agent_tag == 'L') y_final = y_final + 0.3;
+  move_to_point();
+}
+void determine_coordinates_remote(){
+  Get_Direction_Signal();
+  if (received_direction == direction_remote[0]){
+      x_final = x + distance_remote_fixed*cos(theta*PI/180);
+      y_final = y + distance_remote_fixed*sin(theta*PI/180);
+    }
+   else if (received_direction == direction_remote[1]){
+      theta_target = theta + angle_remote_fixed;
+      theta_target = (theta_target > 180) ? theta_target - 360 : theta_target; // keep theta less than or equal to 180
+      theta_target = (theta_target <= -180) ? theta_target + 360 : theta_target; // keep theta greater than -180
+    }
+    else if (received_direction == direction_remote[2]){
+      x_final = x - distance_remote_fixed*cos(theta*PI/180);
+      y_final = y - distance_remote_fixed*sin(theta*PI/180);
+    }
+    else if (received_direction == direction_remote[3]){
+      theta_target = theta - angle_remote_fixed;
+      theta_target = (theta_target > 180) ? theta_target - 360 : theta_target; // keep theta less than or equal to 180
+      theta_target = (theta_target <= -180) ? theta_target + 360 : theta_target; // keep theta greater than -180
+    }
+}
+void Get_Direction_Signal(){
+  bool readable_remote = false;
+  while (!readable_remote){
+    received_direction = (XBee.available()) ? char(XBee.read()) : compare;
+    for (int i = 0; i < 4; i++){
+      if (received_direction == direction_remote[i]){
+        readable_remote = true;
+        break;
+      }
+    }
+    if (readable_remote) Send_Confirmation_Signal_Remote();
+  }
+}
+void Send_Confirmation_Signal_Remote(){
+  int send_confirmation_counter = 0;
+  while (true){
+    delay(10);
+    XBee.write(response_to_rpi_remote);
+    received_tag = (XBee.available()) ? char(XBee.read()) : compare;
+    if (received_tag == correct_data_char) send_confirmation_counter++;
+    if (send_confirmation_counter >= 2){
+      for (int counting = 0; counting < 2; counting++){
+        delay(10);
+        XBee.write(agent_tag);
+      }
+      break;
+    }
+  }
+}
+void XBee_Write_Remote(float y_send, float x_send){
+  correct_signal_sent = false;
+  x_string = XBee_Build_String_Remote_Leader(x,0);
+  y_string = XBee_Build_String_Remote_Leader(y,1);
+  //angle_string = XBee_Build_String_Remote_Leader(theta,2);
+  XBee_Write_Remote_Setup_Leader();
+  Send_Coordinates_Remote_Leader();
+}
+void Send_Coordinates_Remote_Leader(){
+  for (int i = 0; i < number_of_followers; i++){
+    while (true){
+      Serial.print("Sending to agent ");Serial.println(follower_tag[i]);
+      check_correct_agent_Send_Remote_Leader(i);
+      Send_Individual_Remote_Leader();
+      check_readable_data_confirmation_remote_Leader();
+      if (correct_signal_sent) break;
+    }
+    Serial.println("sent to agent");
+  }
+}
+void check_correct_agent_Send_Remote_Leader(int follower){
+  Serial.println("started checking agent");
+  delay(10);
+  while (true){
+    Serial.print("Checking for correct agent ");Serial.println(follower_tag[follower]);
+    XBee.write(follower_tag[follower]);
+    delay(10);
+    received_tag = (XBee.available()) ? char(XBee.read()) : compare;
+    //Serial.print(received_tag[0]); Serial.print("\t"); Serial.println(received_tag[0] == follower_tag[follower]);
+    if (received_tag == follower_tag[follower] && received_tag != compare) break;
+  }
+  Serial.println("Finished checking");
+}
+void check_readable_data_confirmation_remote_Leader(){
+  Serial.println("started check readable confirmation");
+  while (true){
+    received_tag = (XBee.available()) ? char(XBee.read()) : compare;
+    Serial.print("Checking for confirmation ");Serial.println(received_tag);
+    if (received_tag == correct_data_char || received_tag == false_data_char){
+      delay(10);
+      XBee.write(correct_data_char);
+      break;
+    }
+  }
+  correct_signal_sent = received_tag == correct_data_char;
+  Serial.print("correct_Signal_sent" ); Serial.println(correct_signal_sent);
+}
+void Send_Individual_Remote_Leader(){
+  for (int k = 0; k < 2*number_of_bytes_per_value + 2; k++) {
+    delay(10);
+    XBee.write(data_send_num[k]);
+  }
+  Serial.println("Finished sending signal with data");
+}
+void XBee_Write_Remote_Setup_Leader(){
+  data_string = "0";
+  for (int counter_string = 0; counter_string <= 50; counter_string++) data_send_num[counter_string] = '0';
+  data_string = x_string + y_string;
+  //Serial.println(data_string);
+  data_string.toCharArray(data_send_num,50);
+  Serial.println(data_send_num);
+}
+void receive_coordinates_remote_follower(){
+  Serial.println("Getting new ones");
+  for (int i = 0; i < 2*number_of_bytes_per_value + 2; i++) received[i] = '0';
+  Serial.println("Reset received");
+  receive_coordinates_remote_follower_raw();
+  x_leader = Signal_to_Variable(received,true);
+  y_leader = Signal_to_Variable(received,false);
+}
+void receive_coordinates_remote_follower_raw(){
+  Serial.println("Started raw");
+  while (true){
+    Serial.println("Started loop raw");
+    check_correct_agent_remote();
+    Serial.println("Checked agent");
+    int byte_counter = 1;  
+    int counter_double_check = 0;
+    delay(10);
+    while (true){
+          delay(10);
+      Serial.println("double_checking");
+     received_tag = (XBee.available()) ? char(XBee.read()) : compare; 
+     if (received_tag == x_char) break;
+    }
+    received[0] = x_char;
+    while (byte_counter < 2*number_of_bytes_per_value + 2){
+      if (XBee.available()){
+        received[byte_counter] = char(XBee.read());
+        byte_counter++;
+        delay(10);
+      }
+    }
+    Serial.println(received);
+    readable_data = check_readable_data(received);
+    Send_Checking_Signal_Remote(readable_data);
+    Serial.print("readable_data: "); Serial.println(readable_data);
+    if (readable_data) break;
+  }
+}
+void Send_Checking_Signal_Remote(bool readable){
+  char sending_char[1];
+  sending_char[0] = (readable) ? correct_data_char : false_data_char;
+  while (true){
+    Serial.println("Sending checking signal");
+    XBee.write(sending_char[0]);
+    delay(10);
+    received_tag = (XBee.available()) ? char(XBee.read()) : compare;
+    if (isAlphaNumeric(received_tag) && received_tag != compare) break;
+    }
+}
+void check_correct_agent_remote(){
+  // Used to check if the right agent is being called, and to make sure that the agent has reached its final point
+  // (Same code used for a little differrent things)
+  int check_counter = 0;
+  Serial.println("Started Checking for correct");
+  while (true){
+    delay(10);
+    received_tag = (XBee.available()) ? char(XBee.read()) : compare;
+    Serial.print("received in check correct "); Serial.println(received[0]);
+    if (received_tag == agent_tag) check_counter++;
+    if (check_counter >= 2){
+      Serial.println("Sending back when checking for correct agent");
+      for (int sending_twice = 0; sending_twice < 2; sending_twice++){
+        delay(10);
+        XBee.write(agent_tag); 
+      }
+      break;
+    }
+  }
+}
+
+///////////////////////////////////   ACCELEROMETER CALIBRATION FUNCTIONS   ////////////////////////////////////
+void calibration(){ // open source gyroscope calibration function
+  gz_offset=-mean_gz/4;
+  while (1){
+    ready=0;
+    accelgyro.setZGyroOffset(gz_offset);
+    meansensors();
+    Serial.println("...");
+    if (abs(mean_gz)<=giro_deadzone) ready = 1;
+    else gz_offset=gz_offset-mean_gz/(giro_deadzone+1);
+    if (ready==1) break;
+  }
+}
+void meansensors(){ // open source function used in gyroscope calibration
+  long i=0,buff_gz=0;
+  while (i<(buffersize+101)){
+    gz = accelgyro.getRotationZ(); // read raw accel/gyro measurements from device
+    if (i>100 && i<=(buffersize+100)){ //First 100 measures are discarded
+      buff_gz=buff_gz+gz;
+    }
+    if (i==(buffersize+100)){
+      mean_gz=buff_gz/buffersize;
+    }
+    i++;
+    delay(2); //Needed so we don't get repeated measures
+  }
+}
+void Calibration_main() { // open source gyroscope calibration function
+    meansensors();
+    delay(1000);
+    calibration();
+    delay(1000);
+    meansensors();
+}
+
+///////////////////////////////////   MOTOR FUNCTIONS   ////////////////////////////////////
+void check_increase_speeds(bool angle){
+  if (cant_move_counter % 3 == 0){
+    if (lCount_abs - lCount_abs_first < 5 && rCount_abs - rCount_abs_first < 5){
+      Increase_Speeds(angle);
+    }
+    lCount_abs_first = lCount_abs;
+    rCount_abs_first = rCount_abs;
+  }
+}
+void Increase_Speeds(bool angle){
+  while (lCount_abs - lCount_abs_first < 3 || rCount_abs - rCount_abs_first < 3){
+    theta_calc();
+    position_calc();
+    left_speed = (left_speed > 0) ? left_speed + 3 : left_speed - 3;
+    right_speed = (right_speed > 0) ? right_speed + 3 : right_speed - 3;
+    driveArdumoto(MOTOR_L,left_speed);
+    driveArdumoto(MOTOR_R,right_speed);
+  }
+  if (angle) theta_constant = (int) absolute_value(left_speed);
+}
+void stop_motors(){ // sets both motor speeds to 0
+  driveArdumoto(MOTOR_R,0);
+  driveArdumoto(MOTOR_L,0);
+}
+void driveArdumoto(byte motor, int spd){ // driveArdumoto drives 'motor' at speed 'spd'. Negative speeds moves it backwards
+  // On Shannon reverse is 1 and forward is 0. The opposite is true on Laplace and Euler.
+  if(shannon) dir = (spd >= 0) ? 0 : 1; // use this line for Shannon
+  else dir = (spd >= 0) ? 1 : 0; // use this line for Laplace and Euler
+  spd = (spd >= 0) ? spd : -1*spd;
+  if (motor == MOTOR_R)
+  {
+    digitalWrite(DIRA, dir);
+    analogWrite(PWMA, spd);
+  }
+  else if (motor == MOTOR_L)
+  {
+    dir = (dir == 1) ? 0 : 1; // direction is flipped on the left motor for an unknown reason
+    digitalWrite(DIRB, dir);
+    analogWrite(PWMB, spd);
+  }  
+}
+void setupArdumoto(){ // setupArdumoto initialize all motor-related pins
+  // All pins should be setup as outputs:
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(DIRA, OUTPUT);
+  pinMode(DIRB, OUTPUT);
+
+  // Initialize all pins as low:
+  digitalWrite(PWMA, LOW);
+  digitalWrite(PWMB, LOW);
+  digitalWrite(DIRA, LOW);
+  digitalWrite(DIRB, LOW);
+}
+
+/////////////////////////////////////////////////////////// ENCODER FUNCTIONS //////////////////////////////////////////
+int Left_Encoder_Ticks(){ // runs in the background updating left encoder value. Never needs to be called
+  lCount = (left_speed >= 0) ? lCount+1 : lCount-1;
+  lCount_abs++;
+  return lCount;
+}
+int Right_Encoder_Ticks(){ // runs in the background updating right encoder value. Never needs to be called
+  rCount = (right_speed >= 0) ? rCount+1 : rCount-1;
+  rCount_abs++;
+  return rCount;
+}
+
+////////////////////////////////////////////////////// XBEE FUNCTIONS /////////////////////////////////////////
+void receive_positions(){
+  // Receives characters from RPi and reconstructs it to get x and y floats
+  for (int i = 0; i < 2*number_of_bytes_per_value + 2; i++){
+    received[i] = '0'; // Resets the received signal 
+  }
+  if (!first_point_send) check_correct_agent(); // If this is not the first received point, then it will wait for signal from RPi to see and let it know that it is ready to move
+  first_point_send = false; 
+  receive_raw_signal(); 
+  x_final = Signal_to_Variable(received,true); // Converts signal that looks like X0.00Y0.00 to x and y floats
+  y_final = Signal_to_Variable(received,false);
+}
+void receive_raw_signal(){
+  while (true){
+    // Here we make sure that the signal that is being sent is for this agent
+    // Note that the loop in check_correct_agent won't break until the RPi send the agent tag
+    check_correct_agent();
+    // Now we know that the signal that is being sent is the one we care about. This should look like X0.00Y0.00
+    int byte_counter = 0;
+    received_tag = (XBee.available()) ? char(XBee.read()) : compare;   
+    while (byte_counter < 2*number_of_bytes_per_value + 2){
+      if (XBee.available()){
+        received[byte_counter] = char(XBee.read());
+        byte_counter++;
+        delay(20);
+      }
+    } // Build received, which contains as many characters as the string of the right format has. This is just whatever it received from the RPi, so there may be errors in it
+    // Now we need to check if the format of the signal is as desired (i.e. X0.000Y0.000)
+    //Serial.println(received);
+    readable_data = check_readable_data(received);
+    Send_Checking_Signal(readable_data);
+    if (readable_data) break; // If the data is in the right format, then we are confident that the point makes sense
+  }
+}
+void Send_Checking_Signal(bool readable){
+  // Here we send back the signal of whether the received data is in the correct format or not.
+  // After sending it, the Arduino also receives a signal from the RPi, this is to let the Arduino
+  // know that the RPi has received the signal and then the Arduino can stop sending the readable signal.
+  char sending_char[0];
+  sending_char[0] = (readable) ? correct_data_char : false_data_char;
+  while (true){
+    delay(20);
+    XBee.write(sending_char[0]);
+    received_tag = (XBee.available()) ? char(XBee.read()) : compare;
+    if (isAlphaNumeric(received_tag) && received_tag != compare) break;
+    }
+}
+bool check_readable_data(char received_signal[50]){
+  // Will give true if data is in the right format
+  int correct_y = 0;
+  int correct_x = 0;
+  readable_data = false;
+  if (received_signal[0] == x_char && received_signal[number_of_bytes_per_value + 1] == y_char){
+    if (received_signal[2] == '.' && received_signal[number_of_bytes_per_value + 3] == '.'){
+      if (isDigit(received_signal[1]) && isDigit(received_signal[number_of_bytes_per_value + 2])){
+        for (int i = 0; i < (number_of_bytes_per_value - 2); i++){
+          if (isDigit(received_signal[i+3])){
+            correct_x++;
+          }
+          if (isDigit(received_signal[i + number_of_bytes_per_value + 4])){
+            correct_y++;
+          }
+        }
+        readable_data = (correct_x == (number_of_bytes_per_value - 2) && correct_x == correct_y) ? true : false; 
+      }
+    }
+  }
+  return readable_data;
+}
+void check_correct_agent(){
+  // Used to check if the right agent is being called, and to make sure that the agent has reached its final point
+  // (Same code used for a little differrent things)
+  // Since the Arduino often makes errors in terms of when it is receiving a signal, the loop will only break once
+  // it has received that agent's tag twice.
+  int check_counter = 0;
+  while (true){
+    received_tag = (XBee.available()) ? char(XBee.read()) : compare;
+    if (received_tag == agent_tag) check_counter++;
+    if (check_counter >= 2){
+      for (int counting_twice = 0; counting_twice < 2; counting_twice++){
+        delay(20);
+        XBee.write(agent_tag);
+      }
+      break;
+    }
+  }
+}
+float Signal_to_Variable(char received_complete_signal[50], bool x_y_indicator){  // if x_y_indicator  = true, then variable is x, if x_y_indicator = false, then variable is y, size of char is 50 just in case
+  // received_complete_singal will look like X0.000Y0.000
+  char received_variable_char[number_of_bytes_per_value];
+  float received_variable;
+  for (int i = 0; i < number_of_bytes_per_value; i++){
+    received_variable_char[i] = (x_y_indicator) ? received_complete_signal[i+1] : received_complete_signal[i+number_of_bytes_per_value + 2];
+  }
+  received_variable = atof(received_variable_char);  // Converts the char to a float 
+  return received_variable;
+}
+void Ready_to_Start(){
+  while (true){
+    received_tag = (XBee.available()) ? char(XBee.read()) : compare;
+    if (agent_tag == received_tag){
+      delay(20);
+      XBee.write(agent_tag);
+      break;
+    }
+  }
+  //Serial.println("Ready to start");
+}
+String XBee_Build_String(float num, bool isX){ // Set up NUM values that can be send to the RPi
+    if (isX) num_string = "X";
+    else num_string = "Y";
+    if (num >= 0)
+    {
+      if (num < 10 && num != 0){
+        num_string_number = "000" + String(num,2); // Get x with 2 decimal places
+      }
+      else if (num == 0){
+        num_string_number = "0000.000";
+      }
+      else if (num < 100 && num >= 10){
+        num_string_number = "00" + String(num,2); 
+      }
+      else if (num < 1000 && num >= 100){
+        num_string_number = "0" + String(num,2);
+      }
+    }
+    else if (num < 0)
+    {
+      if (num > -10){
+        num_string_number = "-00" + String(-1*num,2);
+      }
+      else if (num > -100 && num <= -10){
+        num_string_number = "-0" + String(-1*num,2);
+      }
+      else if (num > -1000 && num <= -100){
+        num_string_number = String(num,2);
+      }
+    }
+    num_string = num_string + num_string_number;
+    return num_string;
+}
+String XBee_Build_String_Remote_Leader(float num, int value_type){ // Set up NUM values that can be send to the RPi
+  int angle_value;
+    if (value_type == 0) num_string = "X";
+    else if (value_type == 1) num_string = "Y";
+    else{
+      num_string = "A"; // Angle
+      angle_value = (int) num;
+    }
+    if (value_type == 0 || value_type == 1){
+      if (num != 0) num_string_number = num_string_number = String(num,2);
+      else num_string_number = "0.00";
+    }
+    else{
+      if (angle_value > 0){
+        if (angle_value < 10) num_string_number = "000" + String(angle_value);
+        else if (angle_value >= 10 && angle_value < 100) num_string_number = "00" + String(angle_value);
+        else num_string_number = "0" + String(angle_value);      
+      }
+      else if (angle_value < 0){
+        if (angle_value > - 10) num_string_number = "-00" + String(-1*angle_value);
+        else if (angle_value < -10 && angle_value > -100) num_string_number = "-0" + String(-1*angle_value);
+        else num_string_number = String(angle_value); 
+      }
+      else num_string_number = "0000";
+    }
+    num_string = num_string + num_string_number;
+    return num_string;
+}
+void XBee_Write(String string1, String string2){
+   data_string = string1 + string2;
+   data_string.toCharArray(data_send_num,50);
+   XBee.write(data_send_num);   
+}
+
+///////////////////////////////////   MISCELLANEOUS FUNCTIONS   ////////////////////////////////////
+float absolute_value(float num){ //built in Arduino abs() function only works for int values (we think, LOL!)
+  num = (num >= 0) ? num : -1*num;
+  return num;
+}
+void delay_master(int delay_time){ // delays program for delay_time milliseconds, while updating theta and positions in case bot moves
+  start_time = millis();
+  do {
+    theta_calc(); // update theta
+    position_calc(); // update position
+    current_time = millis();
+  } while (current_time < start_time + delay_time);
+}
+void Determing_Start_xy(){
+  if(lloyds_regular){
+    if (agent_tag == 'S'){
+    x = 0;
+    y = 0;
+  }
+  else if (agent_tag == 'E'){
+    x = 0;
+    y = 1.5;
+  }
+  else if (agent_tag == 'L'){
+    x = 0;
+    y = 3;
+  }
+  }
+  else{
+    if (agent_tag == 'S'){
+    x = 3;
+    y = 2;
+  }
+  else if (agent_tag == 'E'){
+    x = 1;
+    y = 1;
+  }
+  else if (agent_tag == 'L'){
+    x = 1;
+    y = 3;
+  }
+  }
+}
